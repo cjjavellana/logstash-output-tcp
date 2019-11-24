@@ -137,7 +137,7 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
       @server_socket = server_socket
 
       if @ssl_enable
-        @server_socket = OpenSSL::SSL::SSLServer.new(@server_socket, @ssl_context)
+        @server_socket = OpenSSL::SSL::SSLServer.new @server_socket, @ssl_context
       end
       @client_threads = []
 
@@ -169,7 +169,7 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
         @client_threads.reject! { |t| !t.alive? }
       end
     else
-      print "Client Socket Address #{@socket_addresses}"
+      @logger.info("Client Socket Address #{@socket_addresses}")
 
       client_socket = nil
       @codec.on_event do |event, payload|
@@ -193,8 +193,6 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
           client_socket = nil
 
           sleep @reconnect_interval
-
-          next_socket_address
           retry
         end
       end
@@ -230,29 +228,41 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
 
   def connect
     Stud.try do
-      socket_address = @socket_addresses[@socket_address_index].split(':')
-      client_socket = TCPSocket.new(socket_address[0], socket_address[1].to_i)
+      @socket_address_index = 0
 
-      if @ssl_enable
-        client_socket = OpenSSL::SSL::SSLSocket.new(client_socket, @ssl_context)
-        begin
-          client_socket.connect
-        rescue OpenSSL::SSL::SSLError => ssle
-          @logger.error('SSL Error', exception: ssle, backtrace: ssle.backtrace)
-          # NOTE(mrichar1): Hack to prevent hammering peer
-          sleep(5)
-          raise
+      begin
+        socket_address = @socket_addresses[@socket_address_index].split(':')
+
+        @logger.info("Connecting to #{socket_address[0]} #{socket_address[1].to_i}")
+        client_socket = TCPSocket.new(socket_address[0], socket_address[1].to_i)
+
+        if @ssl_enable
+          client_socket = OpenSSL::SSL::SSLSocket.new(client_socket, @ssl_context)
+          begin
+            client_socket.connect
+          rescue OpenSSL::SSL::SSLError => ssle
+            @logger.error('SSL Error', exception: ssle, backtrace: ssle.backtrace)
+            # NOTE(mrichar1): Hack to prevent hammering peer
+            sleep(5)
+            raise
+          end
         end
+
+        client_socket.instance_eval {
+          class << self;
+            include ::LogStash::Util::SocketPeer
+          end
+        }
+
+        @logger.debug('Opened connection', client: "#{client_socket.peer}")
+        return client_socket
+      rescue StandardError => e
+        @socket_address_index += 1
+
+        raise e if @socket_address_index >= @socket_addresses.length
+
+        retry
       end
-
-      client_socket.instance_eval {
-        class << self;
-          include ::LogStash::Util::SocketPeer
-        end
-      }
-
-      @logger.debug('Opened connection', client: "#{client_socket.peer}")
-      return client_socket
     end
   end
 

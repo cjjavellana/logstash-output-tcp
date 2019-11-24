@@ -3,3 +3,6 @@ Gemfile.lock
 .bundle
 vendor
 .idea
+jruby-1
+hsperfdata_root
+logstash-7.4.2.tar.gz
