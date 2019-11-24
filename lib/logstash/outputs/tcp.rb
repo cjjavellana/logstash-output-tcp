@@ -16,19 +16,16 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
 
   default :codec, 'json'
 
-  # When mode is `server`, we only listen to the first one
-  # When mode is `client`, we connect to the first one and fail over
-  # to the next when we get an exception while sending the payload
-  # Format: host:port, ip:port
-  config :socket_address, validate: :array, required: true
-
   # When mode is `server`, the address to listen on.
+  # Listens on the first address it successfully binds to
+  #
   # When mode is `client`, the address to connect to.
-  config :host, validate: :string, required: true
-
-  # When mode is `server`, the port to listen on.
-  # When mode is `client`, the port to connect to.
-  config :port, validate: :number, required: true
+  # Connects to the first address it successfully opened a connection to.
+  # If it encounters TCP errors while sending payload, it failovers
+  # to the next configured address
+  #
+  # Format: <hostname>:<port>, <ip>:<port>
+  config :socket_addresses, validate: :array, required: true
 
   # When connect failed,retry interval in sec.
   config :reconnect_interval, validate: :number, default: 10
@@ -69,7 +66,7 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
       loop do
         begin
           @socket.write(@queue.pop)
-        rescue => e
+        rescue StandardError => e
           @logger.warn('tcp output exception', socket: @socket, exception: e)
           break
         end
@@ -85,15 +82,16 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
   end
 
   def initialize(config)
-    super(config)
-    @receiver_socket_address_index = 0
+    @socket_address_index = 0
     @ssl_cert = false
     @ssl_key = nil
     @ssl_verify = false
     @ssl_cacert = nil
     @ssl_enable = false
-    @socket_address = []
+    @socket_addresses = []
     @reconnect_interval = 10
+
+    super(config)
   end
 
   private
@@ -136,15 +134,7 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
     setup_ssl if @ssl_enable
 
     if server?
-      @logger.info('Starting tcp output listener', address: "#{@host}:#{@port}")
-
-      begin
-        @server_socket = TCPServer.new(@host, @port)
-      rescue Errno::EADDRINUSE
-        @logger.error('Could not start TCP server: Address in use',
-                      host: @host, port: @port)
-        raise
-      end
+      @server_socket = server_socket
 
       if @ssl_enable
         @server_socket = OpenSSL::SSL::SSLServer.new(@server_socket, @ssl_context)
@@ -160,7 +150,10 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
                 include ::LogStash::Util::SocketPeer
               end
             }
-            @logger.debug('Accepted connection', client: client_socket.peer, server: "#{@host}:#{@port}")
+            @logger.debug('Accepted connection',
+                          client: client_socket.peer,
+                          server: "#{@socket_addresses[@socket_address_index]}")
+
             client = Client.new(client_socket, @logger)
             Thread.current[:client] = client
             @client_threads << Thread.current
@@ -176,7 +169,7 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
         @client_threads.reject! { |t| !t.alive? }
       end
     else
-      print "Client Socket Address #{@socket_address}"
+      print "Client Socket Address #{@socket_addresses}"
 
       client_socket = nil
       @codec.on_event do |event, payload|
@@ -190,10 +183,9 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
 
           # Now send the payload
           client_socket.syswrite(payload) if w.any?
-        rescue => e
+        rescue StandardError => e
           @logger.warn('tcp output exception',
-                       host: @host,
-                       port: @port,
+                       address: @socket_addresses[@socket_address_index],
                        exception: e,
                        backtrace: e.backtrace)
 
@@ -202,7 +194,7 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
 
           sleep @reconnect_interval
 
-          next_server
+          next_socket_address
           retry
         end
       end
@@ -213,18 +205,34 @@ class LogStash::Outputs::Tcp < LogStash::Outputs::Base
 
   private
 
-  def next_server
-    @receiver_socket_address_index += 1
+  def server_socket
+    while @socket_address_index < @socket_addresses.length
+      begin
+        @logger.info('Starting tcp output listener',
+                     address: "#{@socket_addresses[@socket_address_index]}")
 
-    return unless @receiver_socket_address_index >= @socket_address.length
+        socket_address = @socket_addresses[@socket_address_index].split(':')
+        return TCPServer.new(socket_address[0], socket_address[1].to_i)
+      rescue Errno::EADDRINUSE
+        @logger.error('Could not start TCP server: Address in use', address: @socket_addresses[@socket_address_index])
+        next_socket_address
+      end
+    end
+    raise 'Exhausted all socket address options'
+  end
 
-    @receiver_socket_address_index = 0
+  def next_socket_address
+    @socket_address_index += 1
+    return unless @socket_address_index >= @socket_addresses.length
+
+    @socket_address_index = 0
   end
 
   def connect
     Stud.try do
+      socket_address = @socket_addresses[@socket_address_index].split(':')
+      client_socket = TCPSocket.new(socket_address[0], socket_address[1].to_i)
 
-      client_socket = TCPSocket.new(@host, @port)
       if @ssl_enable
         client_socket = OpenSSL::SSL::SSLSocket.new(client_socket, @ssl_context)
         begin

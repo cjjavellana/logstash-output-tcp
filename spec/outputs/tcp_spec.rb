@@ -7,9 +7,7 @@ describe LogStash::Outputs::Tcp do
 
   let(:config) {
     {
-      'host' => 'localhost',
-      'port' => 2000 + rand(3000),
-      'socket_address' => "localhost:#{2000 + rand(3000)}"
+      'socket_addresses' => ["localhost:#{2000 + rand(3000)}", "127.0.0.1:#{2000 + rand(3000)}"]
     }
   }
 
